@@ -2,7 +2,7 @@
 
 Everything here is text: no model, no GPU. The engine consumes token ids and produces text deltas; this module
 
-  * normalizes OpenAI Chat Completions and Anthropic Messages requests into the chat template's message form,
+  * normalizes OpenAI Chat Completions, Responses and Anthropic Messages requests into the chat template's message form,
   * renders the model's own Jinja chat template (pack `tokenizer/chat_template.jinja`) exactly as Hugging Face
     does (checked against the pack's `chat_golden.json`, 10 cases incl. thinking and tools),
   * parses the streamed output incrementally into reasoning (`<think>...</think>`), content and tool calls in
@@ -59,7 +59,7 @@ def _text_of(content) -> str:
     if isinstance(content, str):
         return content
     return "".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") in
-                   ("text", "input_text", None))
+                   ("text", "input_text", "output_text", None))
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
@@ -123,7 +123,7 @@ def _parts_of(content):
             continue
         if part.get("type") in IMAGE_PARTS:
             items.append({"type": "image", "source": _image_source(part)})
-        elif part.get("type") in ("text", "input_text", None) and "text" in part:
+        elif part.get("type") in ("text", "input_text", "output_text", None) and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
 
@@ -195,6 +195,78 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
     return _late_system_to_user(messages), tools, kwargs
+
+
+def responses_tools(req: dict):
+    """Function and custom definitions with their explicit Responses namespace."""
+    for tool in req.get("tools", []):
+        if tool["type"] == "namespace":
+            for child in tool["tools"]:
+                yield tool["name"], child
+        else:
+            yield None, tool
+
+
+def responses_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+    """Stateless Responses input and tools in the model's chat-template form."""
+    if req.get("previous_response_id") or req.get("conversation") or req.get("store") or req.get("background"):
+        raise ValueError("Responses uses full input history with store=false and background=false")
+    messages = []
+    if req.get("instructions"):
+        messages.append({"role": "system", "content": req["instructions"]})
+    inputs = req.get("input", [])
+    if isinstance(inputs, str):
+        inputs = [{"role": "user", "content": inputs}]
+    reasoning = ""
+    for item in inputs:
+        kind = item.get("type", "message")
+        if kind == "message":
+            content = item.get("content", "")
+            for part in content if isinstance(content, list) else []:
+                if part.get("type") not in ("input_text", "output_text", "text", "input_image"):
+                    raise ValueError(f"unsupported Responses content type: {part.get('type')}")
+            messages.append({"role": item["role"], "content": content})
+            if item["role"] == "assistant" and reasoning:
+                messages[-1]["reasoning_content"], reasoning = reasoning, ""
+        elif kind == "reasoning":
+            if item.get("encrypted_content"):
+                raise ValueError("encrypted reasoning belongs to its originating provider")
+            reasoning += "".join(p["text"] for p in item.get("summary", []))
+        elif kind in ("function_call", "custom_tool_call"):
+            name = (item["namespace"] + "." if item.get("namespace") else "") + item["name"]
+            args = item["arguments"] if kind == "function_call" else {"input": item["input"]}
+            if not messages or messages[-1]["role"] != "assistant":
+                messages.append({"role": "assistant", "content": ""})
+            if reasoning:
+                messages[-1]["reasoning_content"], reasoning = reasoning, ""
+            messages[-1].setdefault("tool_calls", []).append({"function": {"name": name, "arguments": args}})
+        elif kind in ("function_call_output", "custom_tool_call_output"):
+            messages.append({"role": "tool", "content": item["output"]})
+        else:
+            raise ValueError(f"unsupported Responses input type: {kind}")
+    tools = []
+    for namespace, tool in responses_tools(req):
+        kind = tool["type"]
+        if kind == "function":
+            tools.append({k: tool[k] for k in ("name", "description", "parameters") if k in tool})
+        elif kind == "custom":
+            description = tool.get("description", "")
+            if tool.get("format", {}).get("type") == "grammar":
+                fmt = tool["format"]
+                description += "\nInput must follow this " + fmt["syntax"] + " grammar:\n" + fmt["definition"]
+            tools.append({"name": tool["name"], "description": description,
+                          "parameters": {"type": "object", "properties": {"input": {"type": "string"}},
+                                         "required": ["input"], "additionalProperties": False}})
+        else:
+            raise ValueError(f"unsupported Responses tool type: {kind}")
+        if namespace:
+            tools[-1]["name"] = namespace + "." + tool["name"]
+    choice = req.get("tool_choice", "auto")
+    if choice == "none":
+        tools = []
+    elif choice != "auto":
+        raise ValueError("Responses tool_choice supports auto or none")
+    return openai_to_messages({**req, "messages": messages, "tools": tools})
 
 
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:

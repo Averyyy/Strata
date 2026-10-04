@@ -3,7 +3,7 @@
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
     python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
 
-Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
+Endpoints: POST /v1/responses and /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import copy
 import base64
 import hashlib
 import hmac
@@ -51,7 +52,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, openai_to_messages)
+                            images_of, openai_to_messages, responses_to_messages, responses_tools)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -1321,7 +1322,7 @@ class Service:
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
             "concurrency": {"serving": 1, "requested": 1},       # one request at a time; more wait their turn
-            "dialects": ["/v1/chat/completions", "/v1/messages"],
+            "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
@@ -1801,6 +1802,120 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             yield last
 
 
+def responses_events(svc, req, ids, thinking, tools, max_new, cancel):
+    """Responses lifecycle, text, reasoning and client-executed tool events."""
+    response = {"id": "resp_" + uuid.uuid4().hex[:24], "object": "response", "created_at": int(time.time()),
+                "model": svc.model_for(req), "status": "in_progress", "output": [], "error": None,
+                "incomplete_details": None, "usage": None, "store": False}
+    sequence = 0
+    output, calls = [], {}
+    routes = {(namespace + "." if namespace else "") + tool["name"]: (namespace, tool)
+              for namespace, tool in responses_tools(req)}
+    custom = {name for name, (_, tool) in routes.items() if tool["type"] == "custom"}
+
+    def event(kind, **fields):
+        nonlocal sequence
+        value = {"type": kind, "sequence_number": sequence, **fields}
+        sequence += 1
+        return kind, value
+
+    def add(item):
+        index = len(output)
+        output.append(item)
+        return index, event("response.output_item.added", output_index=index, item=copy.deepcopy(item))
+
+    yield event("response.created", response=dict(response))
+    yield event("response.in_progress", response=dict(response))
+    text_index = reasoning_index = None
+    for kind, value in svc.run(ids, thinking, tools, max_new, req, cancel):
+        if kind == "ping":
+            yield None
+        elif kind == "event":
+            ev = value
+            if ev.kind in ("content", "reasoning") and ev.text:
+                if ev.kind == "content":
+                    if text_index is None:
+                        text_index, added = add({"id": "msg_" + uuid.uuid4().hex[:24], "type": "message",
+                                                 "role": "assistant", "status": "in_progress", "content": []})
+                        yield added
+                        part = {"type": "output_text", "text": "", "annotations": []}
+                        output[text_index]["content"].append(part)
+                        yield event("response.content_part.added", item_id=output[text_index]["id"],
+                                    output_index=text_index, content_index=0, part=dict(part))
+                    output[text_index]["content"][0]["text"] += ev.text
+                    yield event("response.output_text.delta", item_id=output[text_index]["id"],
+                                output_index=text_index, content_index=0, delta=ev.text)
+                else:
+                    if reasoning_index is None:
+                        reasoning_index, added = add({"id": "rs_" + uuid.uuid4().hex[:24], "type": "reasoning",
+                                                      "summary": []})
+                        yield added
+                        part = {"type": "summary_text", "text": ""}
+                        output[reasoning_index]["summary"].append(part)
+                        yield event("response.reasoning_summary_part.added", item_id=output[reasoning_index]["id"],
+                                    output_index=reasoning_index, summary_index=0, part=dict(part))
+                    output[reasoning_index]["summary"][0]["text"] += ev.text
+                    yield event("response.reasoning_summary_text.delta", item_id=output[reasoning_index]["id"],
+                                output_index=reasoning_index, summary_index=0, delta=ev.text)
+            elif ev.kind in ("tool_start", "tool_call"):
+                call = ev.call
+                is_custom = call.name in custom
+                field = "input" if is_custom else "arguments"
+                if call.id not in calls:
+                    namespace, definition = routes[call.name]
+                    index, added = add({"id": "fc_" + uuid.uuid4().hex[:24], "type": "custom_tool_call" if is_custom
+                                       else "function_call", "call_id": call.id, "name": definition["name"],
+                                       "status": "in_progress", field: "", **({"namespace": namespace} if namespace else {})})
+                    calls[call.id] = index
+                    yield added
+                index = calls[call.id]
+                if ev.kind == "tool_call":
+                    if is_custom:
+                        text = call.arguments["input"]
+                    elif not output[index][field]:
+                        text = json.dumps(call.arguments, ensure_ascii=False)
+                    else:
+                        text = ""
+                    if text:
+                        output[index][field] += text
+                        yield event("response.custom_tool_call_input.delta" if is_custom else
+                                    "response.function_call_arguments.delta", item_id=output[index]["id"],
+                                    output_index=index, delta=text)
+                    output[index]["status"] = "completed"
+            elif ev.kind == "tool_args" and ev.call.name not in custom:
+                index = calls[ev.call.id]
+                output[index]["arguments"] += ev.text
+                yield event("response.function_call_arguments.delta", item_id=output[index]["id"],
+                            output_index=index, delta=ev.text)
+        elif kind == "done":
+            for index, item in enumerate(output):
+                fields = {"item_id": item["id"], "output_index": index}
+                if item["type"] == "message":
+                    part = item["content"][0]
+                    item["status"] = "completed" if value["finish"] == "stop" else "incomplete"
+                    yield event("response.output_text.done", **fields, content_index=0, text=part["text"])
+                    yield event("response.content_part.done", **fields, content_index=0, part=part)
+                elif item["type"] == "reasoning":
+                    part = item["summary"][0]
+                    yield event("response.reasoning_summary_text.done", **fields, summary_index=0, text=part["text"])
+                    yield event("response.reasoning_summary_part.done", **fields, summary_index=0, part=part)
+                else:
+                    is_custom = item["type"] == "custom_tool_call"
+                    field = "input" if is_custom else "arguments"
+                    yield event("response.custom_tool_call_input.done" if is_custom else
+                                "response.function_call_arguments.done", **fields, **{field: item[field]})
+                yield event("response.output_item.done", output_index=index, item=item)
+            pt, ct = value.get("prompt_tokens", len(ids)), value["completion_tokens"]
+            response.update(output=output, status="completed" if value["finish"] == "stop" else "incomplete",
+                            usage={"input_tokens": pt, "output_tokens": ct, "total_tokens": pt + ct,
+                                   "input_tokens_details": {"cached_tokens": value.get("reused") or 0}})
+            if value["finish"] != "stop":
+                response["incomplete_details"] = {"reason": "max_output_tokens" if value["finish"] == "length"
+                                                  else "cancelled"}
+            yield event("response.completed" if response["status"] == "completed" else "response.incomplete",
+                        response=response)
+
+
 def _is_json(text: str) -> bool:
     try:
         json.loads(text)
@@ -2272,12 +2387,14 @@ def make_handler(svc: Service):
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages"):
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
+                elif path == "/v1/responses":
+                    self._responses(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
                 else:
@@ -2391,6 +2508,11 @@ def make_handler(svc: Service):
                             delta = item["choices"][0]["delta"]
                             content, reasoning = delta.get("content", ""), delta.get("reasoning_content", "")
                             usage, timings = item.get("usage"), item.get("timings")
+                        elif api == "responses":
+                            name, event = item
+                            content = event.get("delta", "") if name == "response.output_text.delta" else ""
+                            reasoning = event.get("delta", "") if name == "response.reasoning_summary_text.delta" else ""
+                            usage, timings = event.get("response", {}).get("usage"), None
                         else:
                             _, event = item
                             delta = event.get("delta", {})
@@ -2465,6 +2587,47 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+
+        def _responses(self, req):
+            req = dict(req)
+            if req.get("max_output_tokens") is not None:
+                req["max_tokens"] = req["max_output_tokens"]
+            req = svc.with_shared(req, "openai")
+            messages, tools, kw = responses_to_messages(req)
+            fmt = req.get("text", {}).get("format", {"type": "text"})
+            if fmt["type"] != "text":
+                raise ValueError("Responses text.format supports text")
+            svc.reasoning_budget(req)
+            svc.load()
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, int(req.get("max_tokens", 32768)))
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            events = self._capture(responses_events(svc, req, ids, thinking, tools, max_new, cancel), "responses")
+            if not req.get("stream"):
+                response = None
+                for item in events:
+                    if item and item[0] in ("response.completed", "response.incomplete"):
+                        response = item[1]["response"]
+                return self._json(200, response)
+            self._sse()
+            try:
+                for item in events:
+                    if item is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        name, event = item
+                        self.wfile.write(f"event: {name}\n".encode() + b"data: " +
+                                         json.dumps(event, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()
+                events.close()
+            except (EngineDied, ValueError) as e:
+                error = {"type": "error", "code": "server_error", "message": str(e)}
+                self._note(error=error)
+                self.wfile.write(b"event: error\ndata: " + json.dumps(error).encode() + b"\n\n")
+                self.wfile.flush()
 
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
@@ -3008,7 +3171,7 @@ def main() -> int:
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
-    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
+    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/responses, /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)

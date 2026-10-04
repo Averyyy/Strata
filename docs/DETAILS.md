@@ -434,6 +434,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | API | Endpoint |
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
+| OpenAI Responses (stream and non-stream, function and custom tools) | `POST /v1/responses` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
@@ -442,6 +443,15 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
+
+`/v1/responses` accepts the full conversation in `input`, `instructions`, `reasoning.effort`,
+`max_output_tokens`, and `tool_choice: "auto"` or `"none"`. Function and custom tool calls and their outputs
+can be replayed in `input`; tool namespaces retain their names, and custom tools use a string `input`
+parameter in the model's chat template. The output cap defaults to 32768 tokens when omitted; an explicit
+0 or -1 uses the context space left after the prompt.
+Streaming returns Responses lifecycle, text, reasoning-summary, and tool events. Requests use
+`store: false`, `background: false`, and `text.format.type: "text"`; history stays with the client.
+Encrypted reasoning is specific to its originating provider.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
