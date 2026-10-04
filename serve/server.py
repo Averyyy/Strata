@@ -28,6 +28,7 @@ import hmac
 import codecs
 import ctypes
 import json
+import math
 import os
 import queue
 import re
@@ -300,6 +301,7 @@ class StrataEngine:
     (`temperature=F top_p=F top_k=N seed=N`, the engine's own spelling).  An absent temperature keeps the
     engine's default, which is greedy; `temperature=0` means the same thing, so it is not forwarded.
     """
+    close_s = 20.0                     # config engine_close_s: orderly KV commit deadline
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
 
@@ -443,6 +445,10 @@ class StrataEngine:
             self.last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
         if len(f) >= 15:                                  # #471 (engine 0.1.36+): the prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
+        if len(f) >= 20:
+            self.last.update(kv_persist_restored_tokens=int(f[15]), kv_persist_read_bytes=int(f[16]),
+                             kv_persist_restore_ms=float(f[17]), kv_persist_write_bytes=int(f[18]),
+                             kv_persist_commit_ms=float(f[19]))
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -614,16 +620,19 @@ class StrataEngine:
 
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        a while). The orderly phase uses engine_close_s; terminate and kill each get 20 s.
+        A persistence-enabled engine must exit successfully before unloading reports success."""
         if self.proc is None:
             return
+        persistence_enabled = "--kv-persist" in self.spawn[1]
+        exit_code = None
         try:
             if self.proc.poll() is None:
                 try:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=self.close_s)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=20)
@@ -637,6 +646,7 @@ class StrataEngine:
             pass
         finally:
             if self.proc.poll() is not None:
+                exit_code = self.proc.returncode
                 if self.pump is not None:
                     self.pump.join(timeout=2)
                 self.proc.stdin.close()
@@ -646,6 +656,8 @@ class StrataEngine:
                 self.proc = None
                 self.ended = True
                 self.progress, self.last = None, {}
+        if persistence_enabled and exit_code != 0:
+            raise EngineStuck(f"KV persistence shutdown did not commit successfully (engine exit {exit_code}); inspect the engine log")
 
 
 class Vision:
@@ -776,6 +788,15 @@ def gpu_list(cfg: dict) -> list[int]:
         return []
     items = g if isinstance(g, (list, tuple)) else str(g).split(",")
     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
+
+
+def engine_close_s(cfg: dict) -> float:
+    """Seconds to allow QUIT to save KV and release the model."""
+    enabled = "--kv-persist" in cfg.get("args", [])
+    value = cfg.get("engine_close_s", 300 if enabled else 20)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError('"engine_close_s" must be positive seconds')
+    return float(value)
 
 
 def engine_silence_s(cfg: dict) -> float:
@@ -1564,6 +1585,8 @@ class Service:
                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
                                 "engine_generated": last.get("generated"),
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                                **{k: last.get(k) for k in ("kv_persist_restored_tokens", "kv_persist_read_bytes",
+                                    "kv_persist_restore_ms", "kv_persist_write_bytes", "kv_persist_commit_ms")},
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "ram_blobs": last.get("ram_blobs"),
@@ -2919,10 +2942,12 @@ def main() -> int:
         # it is told about (WinError 2), so it is made absolute here
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
+            close_deadline = engine_close_s(cfg)
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
+        engine.close_s = close_deadline
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
