@@ -24,7 +24,7 @@ A completed outgoing conversation is saved before a switch or branch rewind. The
 
 The cache chooses the longest exact token/checkpoint prefix that exceeds the resident prefix. It restores the entry's state and resumes from its live state or deepest matching checkpoint. Candidate metadata is read one entry at a time. Startup reads the index, without scanning K/V payloads.
 
-The durable index records a monotonic usage sequence. The directory budget covers snapshots, temporary writes and 2 MiB reserved for the atomic index. Saves evict the least recently used entries when space is needed. `index.kv`, `entry-N.kv` and their lock/temporary files belong to the cache; files outside that namespace are left intact.
+One engine owns a cache directory at a time. The durable index records a monotonic usage sequence. The directory budget covers snapshots, temporary writes and 2 MiB reserved for the atomic index. Saves evict the least recently used entries when space is needed. `index.kv`, `entry-N.kv` and their lock/temporary files belong to the cache; files outside that namespace are left intact.
 
 Writes use a temporary file, durable flush and atomic replacement. I/O failures and incompatible selected state end the operation with an error. `engine_close_s` controls the server's orderly shutdown deadline: 300 seconds by default with persistence enabled, 20 otherwise. Unloading succeeds after a successful engine exit.
 
