@@ -1364,9 +1364,9 @@ int main(int argc, char** argv) {
         }
         }
     }
-    if (o.kv_persist && (!o.serve || o.vision || o.kv != "int8" || o.prompt_cache < 1 ||
+    if (o.kv_persist && (!o.serve || o.kv != "int8" || o.prompt_cache < 1 ||
             o.conversation_cache_mib != 0 || o.mtp.empty() || o.kv_persist_identity.empty())) {
-        std::fprintf(stderr,"strata serve: KV persistence requires text-only --serve, INT8, MTP, prompt checkpoints, an identity and no RAM parking\n"); return 2;
+        std::fprintf(stderr,"strata serve: KV persistence requires --serve, INT8, MTP, prompt checkpoints, an identity and no RAM parking\n"); return 2;
     }
     strata::core::set_coupled_draft(o.coupled_draft);
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
@@ -4584,6 +4584,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<strata::core::PersistentConversation> persistence;
         bool persistence_dirty = false;
         std::vector<int64_t> persistent_last_prompt;
+        std::vector<ImgKey> persistent_last_images;
         if (o.kv_persist) {
             try {
                 std::vector<strata::core::PersistentSession> sessions{{0, &ss}};
@@ -5300,7 +5301,8 @@ int main(int argc, char** argv) {
             }
             if (persistence) {
                 const bool continuing=live_ok&&want_cvec==cvec_cached&&
-                    (starts_with(live,live_imgs)||persistent_last_prompt==ids);
+                    (starts_with(live,live_imgs)||
+                     (persistent_last_prompt==ids && persistent_last_images==req_imgs));
                 if(!continuing) {
                     int64_t resident_prefix=0;
                     if(want_cvec==cvec_cached) {
@@ -5902,7 +5904,7 @@ int main(int argc, char** argv) {
                 live_ok = o.prompt_cache > 0;
             }
             if(persistence&&live_ok&&(std::strcmp(finish,"stop")==0||std::strcmp(finish,"length")==0)) {
-                persistence_dirty=true;persistent_last_prompt=ids;
+                persistence_dirty=true;persistent_last_prompt=ids;persistent_last_images=req_imgs;
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && live_ok) {

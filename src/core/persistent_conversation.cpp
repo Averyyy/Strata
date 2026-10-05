@@ -70,7 +70,10 @@ void PersistentConversation::read_metadata(KvDisk& disk){
     auto expected=directory(spans(saved_checks_,int64_t(saved_live_.size()),false,false));const auto& actual=disk.sections();
     if(expected.size()!=actual.size())bad("persistent section count differs from actual session");
     for(size_t i=0;i<expected.size();++i)if(expected[i].name!=actual[i].name||expected[i].bytes!=actual[i].bytes)bad("persistent section shape differs from actual session");
-    for(const auto& c:saved_checks_){if(c.ids.empty()||c.ids.size()>saved_live_.size()||!std::equal(c.ids.begin(),c.ids.end(),saved_live_.begin()))bad("checkpoint is not live prefix");}
+    for(const auto& c:saved_checks_){
+        if(c.ids.empty()||c.ids.size()>saved_live_.size()||!std::equal(c.ids.begin(),c.ids.end(),saved_live_.begin()))bad("checkpoint is not live prefix");
+        if(!conversation_image_prefix(c.imgs,c.ids.size(),saved_images_))bad("checkpoint image prefix differs from live conversation");
+    }
  }
 
 void PersistentConversation::sync(){
