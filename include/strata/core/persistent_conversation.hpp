@@ -17,6 +17,9 @@ public:
                              std::vector<ConversationCheckpoint>& checkpoints, uint64_t& clock);
     void save(const std::vector<int32_t>& live, const std::vector<ConversationImageKey>& images,
               const std::vector<ConversationCheckpoint>& checkpoints, bool cvec);
+    void save_slot(const std::vector<int32_t>& live, const std::vector<ConversationImageKey>& images,
+                   const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                   const std::vector<PersistentSession>& sessions);
     uint64_t loaded() const { return loaded_; }
     uint64_t restored() const { return restored_; }
     uint64_t saved() const { return saved_; }
@@ -37,6 +40,7 @@ private:
     MtpDrafter& draft_;
     size_t checkpoint_limit_;
     bool saved_cvec_ = true;
+    bool saved_draft_ = true;
     uint64_t loaded_ = 0, restored_ = 0, saved_ = 0;
     uint64_t read_bytes_ = 0, write_bytes_ = 0;
     double restore_ms_ = 0, commit_ms_ = 0;
@@ -44,8 +48,12 @@ private:
     std::vector<ConversationImageKey> saved_images_;
     std::vector<ConversationCheckpoint> saved_checks_;
     std::vector<PersistentGpuSpan> spans(std::vector<ConversationCheckpoint>& checks, int64_t tokens,
-                                         bool allocate, bool saving);
-    void sync();
+                                         bool allocate, bool saving,
+                                         const std::vector<PersistentSession>& sessions, bool draft);
+    void sync(const std::vector<PersistentSession>& sessions, bool draft);
+    void save_state(const std::vector<int32_t>& live, const std::vector<ConversationImageKey>& images,
+                    const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                    const std::vector<PersistentSession>& sessions, bool draft);
     void read_metadata(KvDisk& disk);
 };
 } // namespace strata::core

@@ -1549,8 +1549,8 @@ int main(int argc, char** argv) {
         }
     }
     if (o.kv_persist && (!o.serve || o.kv != "int8" || o.prompt_cache < 1 ||
-            o.conversation_cache_mib != 0 || o.batch != 0 || o.mtp.empty() || o.kv_persist_identity.empty())) {
-        std::fprintf(stderr,"strata serve: KV persistence requires --serve, INT8, MTP, prompt checkpoints, an identity, no RAM parking and no batch slots\n"); return 2;
+            o.conversation_cache_mib != 0 || o.mtp.empty() || o.kv_persist_identity.empty())) {
+        std::fprintf(stderr,"strata serve: KV persistence requires --serve, INT8, MTP, prompt checkpoints, an identity and no RAM parking\n"); return 2;
     }
     strata::core::set_coupled_draft(o.coupled_draft);
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
@@ -5931,6 +5931,8 @@ int main(int argc, char** argv) {
             // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
             // instead of reading its history again (see `slot_source` in the request path).
             std::vector<int32_t> ids;
+            std::vector<ImgKey> imgs;
+            bool persistence_dirty = false;
             bool cached = false;           ///< idle, and its sessions still hold `ids`
             bool cvec = true;              ///< the control vector setting `ids` were read with
             bool img = false;              ///< the conversation has pictures (never reused from the slot)
@@ -5943,6 +5945,28 @@ int main(int argc, char** argv) {
             bool partial = false, partial_from0 = false;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        auto persist_slot = [&](int b) -> bool {
+            BSlot& sl = bs[(size_t) b];
+            if (!persistence || !sl.persistence_dirty) return true;
+            std::vector<strata::core::PersistentSession> sessions;
+            for (size_t k = 0; k < bslot_ss.size(); ++k)
+                sessions.push_back({k == 0 ? 0 : stages[k - 1]->dev, bslot_ss[k][(size_t) b].get()});
+            try {
+                persistence->save_slot(sl.ids, sl.imgs, sl.checks, sl.cvec, sessions);
+                sl.persistence_dirty = false;
+                std::fprintf(stderr, "strata serve: KV_PERSIST committed_slot=%d\n", b);
+                return true;
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "strata serve: %s\n", error.what());
+                std::printf("ERR %s\n", error.what());
+                std::fflush(stdout);
+                return false;
+            }
+        };
+        auto persist_slots = [&]() -> bool {
+            for (int b = 0; b < (int) bs.size(); ++b) if (!persist_slot(b)) return false;
+            return true;
+        };
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -5961,6 +5985,7 @@ int main(int argc, char** argv) {
         };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+            if (!persist_slot(b)) { e = "batch slot disk commit failed"; return false; }
             const int64_t upto = (int64_t) ids.size();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
@@ -6074,6 +6099,7 @@ int main(int argc, char** argv) {
                     std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                     sl.active = false;
                     sl.cached = o.prompt_cache > 0 && !sl.img;   // its sessions hold sl.ids for the next turn
+                    sl.persistence_dirty = persistence && (eos || !sl.stop);
                 } else {
                     sl.x = y;
                     sl.p += 1;
@@ -6158,6 +6184,7 @@ int main(int argc, char** argv) {
                         std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = false;   // the pipeline's pad rows: a pipelined slot is not reused as a cache
+                        sl.persistence_dirty = persistence && (eos || !sl.stop);
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -6181,7 +6208,9 @@ int main(int argc, char** argv) {
                     if (!may_start) continue;
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
-                        if (!pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
+                        bool dirty = false;
+                        for (int t = 0; t < GS; ++t) dirty |= bs[(size_t) (gi * GS + t)].persistence_dirty;
+                        if (!dirty && !pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
                     }
                     if (pick < 0) continue;
                     rr = pick + 1;
@@ -6225,14 +6254,22 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        auto advance_batch = [&]() -> bool {
+            if (!piped) return batch_step();
+            if (!pump(true)) return false;
+            if (std::any_of(bs.begin(), bs.end(), [](const BSlot& sl) { return sl.persistence_dirty; })) {
+                if (!pipe_drain() || !persist_slots()) return false;
+            }
+            return true;
+        };
         for (;;) {
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
-                    if (!(piped ? pump(true) : batch_step())) return 1;
+                    if (!advance_batch()) return 1;
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
-                if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
+                if (piped && line.rfind("BSTOP ", 0) != 0 && (!pipe_drain() || !persist_slots())) return 1;
             } else if (!next_line(line)) {
                 break;
             }
@@ -6461,6 +6498,7 @@ int main(int argc, char** argv) {
             const uint64_t persisted_write0=persistence?persistence->write_bytes():0;
             const double persisted_restore0=persistence?persistence->restore_ms():0;
             const double persisted_commit0=persistence?persistence->commit_ms():0;
+            if (admit_slot >= 0 && !persist_slot(admit_slot)) return 1;
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
@@ -6487,6 +6525,11 @@ int main(int argc, char** argv) {
                     if(want_cvec==cvec_cached) {
                         if(live_ok&&starts_with(live,live_imgs))resident_prefix=int64_t(live.size());
                         for(const auto& checkpoint:checks)if(starts_with(checkpoint.ids,checkpoint.imgs))
+                            resident_prefix=std::max(resident_prefix,int64_t(checkpoint.ids.size()));
+                    }
+                    for (const auto& sl : bs) if (!sl.active && sl.cached && sl.cvec == want_cvec) {
+                        if (starts_with(sl.ids, sl.imgs)) resident_prefix=std::max(resident_prefix,int64_t(sl.ids.size()));
+                        for (const auto& checkpoint : sl.checks) if (starts_with(checkpoint.ids, checkpoint.imgs))
                             resident_prefix=std::max(resident_prefix,int64_t(checkpoint.ids.size()));
                     }
                     try {
@@ -6566,6 +6609,7 @@ int main(int argc, char** argv) {
             if (slot_source >= 0) {
                 const auto t0 = Clock::now();
                 if (!copy_from_slot(slot_source, slot_ck, err)) {
+                    if (persistence) { std::printf("ERR restoring batch slot: %s\n", err.c_str()); return 1; }
                     // the main session may be half written: read this prompt from the start
                     std::fprintf(stderr, "strata batch: restoring slot %d failed (%s); reading the prompt\n",
                                  slot_source, err.c_str());
@@ -6985,6 +7029,7 @@ int main(int argc, char** argv) {
                             e = "yield";
                             return false;
                         }
+                        if (can && persistence) { e = "BYIELD slot transfer failed: " + ye; return false; }
                         if (can) bs[(size_t) ys].cached = false;   // half written
                         std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
@@ -7433,6 +7478,7 @@ int main(int argc, char** argv) {
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
+                    if (persistence) { std::printf("ERR admitting batch slot: %s\n", err.c_str()); return 1; }
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
@@ -7448,6 +7494,7 @@ int main(int argc, char** argv) {
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
+                    sl.imgs = live_imgs;
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
                     const ConvCheckpoint* best = nullptr;
@@ -7455,7 +7502,8 @@ int main(int argc, char** argv) {
                         if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
                             std::equal(c.ids.begin(), c.ids.end(), live.begin()))
                             best = &c;
-                    if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    if (best != nullptr) sl.checks.push_back(*best);
+                    persistence_dirty = false;   // the request continues in the slot
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
@@ -7543,6 +7591,7 @@ int main(int argc, char** argv) {
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
         }
         if (persistence) {
+            if (!persist_slots()) return 1;
             if(persistence_dirty) {
                 try { persistence->save(live,live_imgs,checks,cvec_cached); }
                 catch(const std::exception& error) { std::fprintf(stderr,"strata serve: %s\n",error.what()); return 1; }

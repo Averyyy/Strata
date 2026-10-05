@@ -7,6 +7,7 @@
 
 namespace strata::core {
 namespace {
+constexpr const char* slot_signature = "/batch-slot-v1";
 [[noreturn]] void bad(const std::string& s){throw std::runtime_error("KV persistence: "+s);}
 void tokens(PersistentEncoder& e,const std::vector<int32_t>& ids){e.number(ids.size());for(auto id:ids)e.number(uint64_t(id));}
 std::vector<int32_t> tokens(PersistentDecoder& d,int64_t context){
@@ -61,13 +62,15 @@ PersistentConversation::PersistentConversation(const std::string& directory,uint
 
 void PersistentConversation::read_metadata(KvDisk& disk){
     saved_live_.clear();saved_images_.clear();saved_checks_.clear();
-    PersistentDecoder d{disk.metadata()};if(d.text(65536)!=signature_)bad("effective engine geometry/configuration differs from committed cache");
+    PersistentDecoder d{disk.metadata()};const auto signature=d.text(65536);
+    saved_draft_=signature==signature_;
+    if(!saved_draft_&&signature!=signature_+slot_signature)bad("effective engine geometry/configuration differs from committed cache");
     auto cv=d.number();if(cv>1)bad("invalid steering state");saved_cvec_=cv!=0;
     saved_live_=tokens(d,sessions_[0].state->max_cells);if(saved_live_.empty())bad("empty persisted conversation");saved_images_=pictures(d,saved_live_.size());
     auto count=d.number();if(count>checkpoint_limit_)bad("checkpoint count exceeds configuration");
     for(uint64_t i=0;i<count;++i)saved_checks_.push_back(checkpoint_metadata(d,sessions_[0].state->max_cells,sessions_.size()-1));
     d.finish();
-    auto expected=directory(spans(saved_checks_,int64_t(saved_live_.size()),false,false));const auto& actual=disk.sections();
+    auto expected=directory(spans(saved_checks_,int64_t(saved_live_.size()),false,false,sessions_,saved_draft_));const auto& actual=disk.sections();
     if(expected.size()!=actual.size())bad("persistent section count differs from actual session");
     for(size_t i=0;i<expected.size();++i)if(expected[i].name!=actual[i].name||expected[i].bytes!=actual[i].bytes)bad("persistent section shape differs from actual session");
     for(const auto& c:saved_checks_){
@@ -76,12 +79,13 @@ void PersistentConversation::read_metadata(KvDisk& disk){
     }
  }
 
-void PersistentConversation::sync(){
-    for(auto s:sessions_){OnDevice on(s.device);auto rc=cudaDeviceSynchronize();if(rc!=cudaSuccess)bad(std::string("session synchronization failed: ")+cudaGetErrorString(rc));}
-    OnDevice on(draft_.device());std::string error;if(!draft_.idle(error))bad(error);
+void PersistentConversation::sync(const std::vector<PersistentSession>& sessions,bool draft){
+    for(auto s:sessions){OnDevice on(s.device);auto rc=cudaDeviceSynchronize();if(rc!=cudaSuccess)bad(std::string("session synchronization failed: ")+cudaGetErrorString(rc));}
+    if(draft){OnDevice on(draft_.device());std::string error;if(!draft_.idle(error))bad(error);}
 }
 
-std::vector<PersistentGpuSpan> PersistentConversation::spans(std::vector<ConversationCheckpoint>& checks,int64_t n,bool allocate,bool saving){
+std::vector<PersistentGpuSpan> PersistentConversation::spans(std::vector<ConversationCheckpoint>& checks,int64_t n,bool allocate,bool saving,
+        const std::vector<PersistentSession>& sessions,bool draft){
     std::vector<PersistentGpuSpan> out;
     auto add=[&](std::string name,void* ptr,size_t bytes,bool host,int device){if(bytes&&!ptr&&(saving||allocate))bad("missing state buffer");out.push_back({{std::move(name),uint64_t(bytes)},static_cast<uint8_t*>(ptr),host,device});};
     auto cp=[&](ConversationCheckpoint& c,const PersistentSession& s,const std::string& prefix){
@@ -94,8 +98,8 @@ std::vector<PersistentGpuSpan> PersistentConversation::spans(std::vector<Convers
         if((saving||allocate)&&!conversation_checkpoint_validate(c,*s.state,g_,error))bad(error);
         for(size_t i=0;i<5;++i)add(prefix+"/"+std::to_string(i),buffers[i]->empty()?nullptr:buffers[i]->data(),sizes[i],true,s.device);
     };
-    for(size_t i=0;i<sessions_.size();++i){
-        auto s=sessions_[i];auto& ss=*s.state;OnDevice on(s.device);ConversationStateSizes z;std::string error;
+    for(size_t i=0;i<sessions.size();++i){
+        auto s=sessions[i];auto& ss=*s.state;OnDevice on(s.device);ConversationStateSizes z;std::string error;
         if(!conversation_session_sizes(g_,ss,z,error))bad(error);
         const auto prefix="stage/"+std::to_string(i);
         add(prefix+"/gdn",ss.gdn_state,z.gdn,false,s.device);add(prefix+"/ple",ss.ple_hist,ss.ple_hist?z.ple:0,false,s.device);
@@ -105,10 +109,10 @@ std::vector<PersistentGpuSpan> PersistentConversation::spans(std::vector<Convers
             if(!conversation_kv_spans(st,g_,n,true,qp,s.device,out,error))bad(error);
         }
     }
-    {OnDevice on(draft_.device());std::string error;if(!conversation_kv_spans(draft_.kv_state(),g_,n,false,"draft",draft_.device(),out,error))bad(error);}
-    for(size_t i=0;i<checks.size();++i){auto& c=checks[i];if(c.stage_parts.size()!=sessions_.size()-1)bad("checkpoint session carve count differs");
-        cp(c,sessions_[0],"check/"+std::to_string(i)+"/stage/0");
-        for(size_t j=1;j<sessions_.size();++j){auto& part=c.stage_parts[j-1];if(!part.stage_parts.empty()||part.ids!=c.ids)bad("checkpoint stage token prefix differs");cp(part,sessions_[j],"check/"+std::to_string(i)+"/stage/"+std::to_string(j));}
+    if(draft){OnDevice on(draft_.device());std::string error;if(!conversation_kv_spans(draft_.kv_state(),g_,n,false,"draft",draft_.device(),out,error))bad(error);}
+    for(size_t i=0;i<checks.size();++i){auto& c=checks[i];if(c.stage_parts.size()!=sessions.size()-1)bad("checkpoint session carve count differs");
+        cp(c,sessions[0],"check/"+std::to_string(i)+"/stage/0");
+        for(size_t j=1;j<sessions.size();++j){auto& part=c.stage_parts[j-1];if(!part.stage_parts.empty()||part.ids!=c.ids)bad("checkpoint stage token prefix differs");cp(part,sessions[j],"check/"+std::to_string(i)+"/stage/"+std::to_string(j));}
     }
     return out;
 }
@@ -130,28 +134,48 @@ bool PersistentConversation::restore_if_matching(const std::vector<int64_t>& pro
     KvDisk disk(lru_.path(selected),lru_.budget()*2,identity_);
     if(!disk.inspect())bad("selected entry disappeared");
     read_metadata(disk);
-    sync();checks.clear();auto buffers=spans(saved_checks_,int64_t(saved_live_.size()),true,false);
+    sync(sessions_,true);checks.clear();auto buffers=spans(saved_checks_,int64_t(saved_live_.size()),true,false,sessions_,saved_draft_);
     auto t0=std::chrono::steady_clock::now();bytes_=disk.file_bytes();
     disk.restore(directory(buffers),[&](size_t i,uint64_t at,const uint8_t* b,size_t n){transfer(buffers.at(i),at,const_cast<uint8_t*>(b),n,true);});
     for(auto s:sessions_){OnDevice on(s.device);std::string error;for(int64_t j=0;j<s.state->qsa_alloc;++j)if(!conversation_kv_residency_restore(s.state->qsa_states[s.state->qsa_ord0+j],g_,int64_t(saved_live_.size()),error))bad(error);}
-    {OnDevice on(draft_.device());std::string error;if(!conversation_kv_residency_restore(draft_.kv_state(),g_,int64_t(saved_live_.size()),error))bad(error);}
-    sync();for(const auto& span:buffers)read_bytes_+=span.section.bytes;
+    {OnDevice on(draft_.device());std::string error;
+        if(saved_draft_){if(!conversation_kv_residency_restore(draft_.kv_state(),g_,int64_t(saved_live_.size()),error))bad(error);}
+        else {
+            qsa_state_zero(draft_.kv_state_rw(),g_,nullptr);
+            std::vector<PersistentGpuSpan> empty;
+            if(!conversation_kv_spans(draft_.kv_state(),g_,int64_t(saved_live_.size()),false,"draft",draft_.device(),empty,error))bad(error);
+            for(const auto& span:empty){
+                if(span.host)std::memset(span.address,0,size_t(span.section.bytes));
+                else if(span.section.bytes){auto status=cudaMemset(span.address,0,size_t(span.section.bytes));if(status!=cudaSuccess)bad(cudaGetErrorString(status));}
+            }
+            if(!conversation_kv_residency_restore(draft_.kv_state(),g_,int64_t(saved_live_.size()),error))bad(error);
+        }
+    }
+    sync(sessions_,true);for(const auto& span:buffers)read_bytes_+=span.section.bytes;
     const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();restore_ms_+=elapsed;
     live=std::move(saved_live_);live_imgs=std::move(saved_images_);checks=std::move(saved_checks_);for(const auto& c:checks)clock=std::max(clock,c.used);
     restored_+=uint64_t(best);lru_.touch(selected);
-    std::fprintf(stderr,"strata serve: KV_PERSIST restored entry=%llu tokens=%lld stored_tokens=%zu bytes=%llu stages=%zu ms=%.1f\n",(unsigned long long)selected,(long long)best,live.size(),(unsigned long long)bytes_,sessions_.size(),elapsed);return true;
+    std::fprintf(stderr,"strata serve: KV_PERSIST restored entry=%llu tokens=%lld stored_tokens=%zu bytes=%llu stages=%zu draft=%d ms=%.1f\n",(unsigned long long)selected,(long long)best,live.size(),(unsigned long long)bytes_,sessions_.size(),saved_draft_,elapsed);return true;
 }
 
 void PersistentConversation::save(const std::vector<int32_t>& live,const std::vector<ConversationImageKey>& imgs,const std::vector<ConversationCheckpoint>& checks,bool cvec){
+    save_state(live,imgs,checks,cvec,sessions_,true);
+}
+void PersistentConversation::save_slot(const std::vector<int32_t>& live,const std::vector<ConversationImageKey>& imgs,
+        const std::vector<ConversationCheckpoint>& checks,bool cvec,const std::vector<PersistentSession>& sessions){
+    save_state(live,imgs,checks,cvec,sessions,false);
+}
+void PersistentConversation::save_state(const std::vector<int32_t>& live,const std::vector<ConversationImageKey>& imgs,
+        const std::vector<ConversationCheckpoint>& checks,bool cvec,const std::vector<PersistentSession>& sessions,bool draft){
     if(live.empty())bad("cannot commit empty conversation");
-    sync();PersistentEncoder e;e.text(signature_);e.number(cvec?1:0);tokens(e,live);pictures(e,imgs);e.number(checks.size());
+    sync(sessions,draft);PersistentEncoder e;e.text(draft?signature_:signature_+slot_signature);e.number(cvec?1:0);tokens(e,live);pictures(e,imgs);e.number(checks.size());
     if(checks.size()>checkpoint_limit_)bad("checkpoint limit exceeded");
     for(const auto& c:checks)checkpoint_metadata(e,c);
     // Existing checkpoints are read-only while the serialized request owns the engine.
-    auto buffers=spans(const_cast<std::vector<ConversationCheckpoint>&>(checks),int64_t(live.size()),false,true);
+    auto buffers=spans(const_cast<std::vector<ConversationCheckpoint>&>(checks),int64_t(live.size()),false,true,sessions,draft);
     auto t0=std::chrono::steady_clock::now();auto entry=lru_.save(identity_,e.data,directory(buffers),[&](size_t i,uint64_t at,uint8_t* b,size_t n){transfer(buffers.at(i),at,b,n,false);});++saved_;
     const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
     commit_ms_+=elapsed;bytes_=lru_.entries().back().bytes;write_bytes_+=bytes_;
-    std::fprintf(stderr,"strata serve: KV_PERSIST saved entry=%llu tokens=%zu bytes=%llu stages=%zu commits=%llu ms=%.1f\n",(unsigned long long)entry,live.size(),(unsigned long long)bytes_,sessions_.size(),(unsigned long long)saved_,elapsed);
+    std::fprintf(stderr,"strata serve: KV_PERSIST saved entry=%llu tokens=%zu bytes=%llu stages=%zu draft=%d commits=%llu ms=%.1f\n",(unsigned long long)entry,live.size(),(unsigned long long)bytes_,sessions.size(),draft,(unsigned long long)saved_,elapsed);
 }
 } // namespace strata::core

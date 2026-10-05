@@ -890,6 +890,12 @@ class StrataEngine:
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
         yields, solo_again = 0, 0
+        disk_metrics = {}
+        def record_disk_metrics():
+            for key in ("kv_persist_restored_tokens", "kv_persist_read_bytes", "kv_persist_restore_ms",
+                        "kv_persist_write_bytes", "kv_persist_commit_ms"):
+                if key in self.last:
+                    disk_metrics[key] = disk_metrics.get(key, 0) + self.last[key]
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -923,6 +929,7 @@ class StrataEngine:
                                     self._send(f"BYIELD {reserved}")
                             yield None
                     phase = "none"                          # its DONE is read
+                    record_disk_metrics()
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -987,6 +994,7 @@ class StrataEngine:
                                 self._send(f"BYIELD {slot}")
                                 asked = True
                             yield None
+                    record_disk_metrics()
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
                     while pending:
@@ -1059,12 +1067,15 @@ class StrataEngine:
                 if phase == "solo":
                     self._send("STOP")
                     self._drain_control("DONE")
+                    record_disk_metrics()
                 elif phase == "admit":
                     line = self._drain_control("BADM")
+                    record_disk_metrics()
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
             except EngineDied:
                 pass
+            self.last.update(disk_metrics)
             if holding:
                 self.ctl.release()
             if reserved is not None:
