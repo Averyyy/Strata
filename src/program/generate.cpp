@@ -6620,18 +6620,19 @@ int main(int argc, char** argv) {
                     resume = 0;
                     from_live = false;
                 } else {
-                    checks.clear();   // the main session's checkpoints were of the conversation it held before
+                    checks = bs[(size_t) slot_source].checks;
+                    checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+                        return (int64_t) c.ids.size() > slot_tokens;
+                    }), checks.end());
                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
                     // checkpoints as if it had not stopped
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
-                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
                         bs[(size_t) slot_source].partial = false;
                     }
                     if (slot_ck != nullptr) {
                         live = slot_ck->ids;
-                        checks.push_back(*slot_ck);   // the main session's chain has it now
-                        checks.back().used = ++check_clock;
+                        for (auto& c : checks) if (c.ids == live) c.used = ++check_clock;
                     } else {
                         live = bs[(size_t) slot_source].ids;
                     }

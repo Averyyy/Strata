@@ -87,6 +87,10 @@ def main():
     env['STRATA_IQ_MT_MIN'] = '1'
     results = {'slots': args.slots, 'groups': args.groups, 'input_tokens': list(map(len, prompts))}
     count = 128 if args.groups > 1 else 12
+    def chat(text):
+        return tok.encode(template.render([{'role': 'user', 'content': text}], enable_thinking=False), parse_special=True)
+    cancel_prompt = chat('Write a long essay about music.')
+    other_prompt = chat('Name three colors.')
     def open_engine(name, persist):
         command = list(base)
         if persist:
@@ -112,6 +116,9 @@ def main():
                          if t is not None]
         results['reference'] = expected
         results['solo_reference'] = solo_expected
+        if args.groups == 1:
+            cancel_first = [t for t in reference.generate(cancel_prompt, 1, {'temperature': 0}, threading.Event())
+                            if t is not None]
     finally:
         reference.close()
     candidate = open_engine('candidate', 'candidate')
@@ -119,20 +126,26 @@ def main():
         actual_warm = pair(candidate, prompts, count, cross_group=args.groups > 1)
         require([r['ids'] for r in warm] == [r['ids'] for r in actual_warm], 'initial batch output differs')
         if args.groups == 1:
-            # Overwriting slot 0 must commit A. Cancelled C must not become a committed conversation.
-            cancel_prompt = tok.encode(template.render([{'role': 'user', 'content': 'Write a long essay about music.'}],
-                                                        enable_thinking=False), parse_special=True)
+            # C is cancelled in a slot, then completed on the solo path. Its prompt checkpoint must survive.
             output, metrics, running = admission(candidate, 0, cancel_prompt, 2000)
             require(running, 'cancellation request did not enter a slot')
             require(metrics['kv_persist_write_bytes'] > 0, 'slot overwrite did not commit completed state')
             candidate._send('BSTOP 0')
             require(finish(candidate, 0, output) == 'cancel', 'slot was not cancelled')
+            saved = re.findall(r'KV_PERSIST saved .*?tokens=(\d+)', (args.output / 'candidate.log').read_text())
+            require(len(saved) == 1 and int(saved[0]) == len(prompts[0]) + count - 1, 'cancelled slot was committed')
+            list(candidate.generate(other_prompt, 1, {'temperature': 0}, threading.Event()))
+            resumed = [t for t in candidate.generate(cancel_prompt + output, 16, {'temperature': 0}, threading.Event())
+                       if t is not None]
+            require(candidate.last['reused'] >= len(cancel_prompt) + len(output) - 1, 'cancelled slot was not reused')
+            results['cancelled_to_solo'] = {'partial': output, 'completed': resumed}
     finally:
         candidate.close()
     if args.groups == 1:
         saved = re.findall(r'KV_PERSIST saved .*?tokens=(\d+)', (args.output / 'candidate.log').read_text())
-        require(len(saved) == 2 and all(int(n) > len(cancel_prompt) for n in saved),
-                'cancelled slot was committed or a completed slot was lost')
+        require(sorted(map(int, saved)) == sorted([len(p) + count - 1 for p in prompts] +
+                    [len(other_prompt), len(cancel_prompt) + len(output) + len(resumed) - 1]),
+                'committed conversations differ from completed work')
     restored = open_engine('restored', 'candidate')
     try:
         actual = pair(restored, continued, count)
@@ -140,6 +153,13 @@ def main():
         require(all(r['kv_persist_restored_tokens'] > 0 and r['kv_persist_read_bytes'] > 0 for r in actual),
                 'a completed slot did not restore actual disk state')
         results['restored'] = actual
+        if args.groups == 1:
+            restarted = [t for t in restored.generate(cancel_prompt, 1, {'temperature': 0}, threading.Event())
+                         if t is not None]
+            require(restarted == cancel_first, 'restored solo prompt output differs')
+            require(restored.last['kv_persist_restored_tokens'] >= len(cancel_prompt) - 2 and
+                    restored.last['kv_persist_read_bytes'] > 0, 'slot-to-solo prompt checkpoint did not restore')
+            results['slot_to_solo_checkpoint'] = dict(restored.last)
     finally:
         restored.close()
     solo = open_engine('solo-restored', 'candidate')
