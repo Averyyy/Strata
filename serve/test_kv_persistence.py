@@ -16,10 +16,13 @@ class Persistence(unittest.TestCase):
 
     def test_request_disk_metrics(self):
         engine = StrataEngine("missing", [], lazy=True)
-        engine._parse_done("DONE 64 4096 120.1 650.2 length 31 49 2048 100 200 0 3 1.2 2048 2048 2800000 12.3 0 0.0")
+        engine._parse_done("DONE 64 4096 120.1 650.2 length 31 49 2048 100 200 0 3 1.2 2048 25 2048 2800000 12.3 0 0.0")
+        self.assertEqual(engine.last["offloaded"], 25)
         self.assertEqual(engine.last["kv_persist_restored_tokens"], 2048)
         self.assertEqual(engine.last["kv_persist_read_bytes"], 2800000)
+        self.assertEqual(engine.last["kv_persist_restore_ms"], 12.3)
         self.assertEqual(engine.last["kv_persist_write_bytes"], 0)
+        self.assertEqual(engine.last["kv_persist_commit_ms"], 0.0)
 
     def engine_and_process(self, code):
         engine = StrataEngine("missing", ["--kv-persist"], lazy=True)
