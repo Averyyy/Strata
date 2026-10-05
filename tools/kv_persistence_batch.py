@@ -157,7 +157,8 @@ def main():
             restarted = [t for t in restored.generate(cancel_prompt, 1, {'temperature': 0}, threading.Event())
                          if t is not None]
             require(restarted == cancel_first, 'restored solo prompt output differs')
-            require(restored.last['kv_persist_restored_tokens'] >= len(cancel_prompt) - 2 and
+            turn_end = cancel_prompt.index(tok.encode('<|im_end|>', parse_special=True)[0]) + 1
+            require(restored.last['kv_persist_restored_tokens'] >= turn_end and
                     restored.last['kv_persist_read_bytes'] > 0, 'slot-to-solo prompt checkpoint did not restore')
             results['slot_to_solo_checkpoint'] = dict(restored.last)
     finally:
